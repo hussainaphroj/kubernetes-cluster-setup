@@ -1,0 +1,180 @@
+---
+- hosts: all
+  become: true
+  vars:
+    node_port: '192.168.56.80'
+    user: 'vagrant'
+  tasks:
+  - name: Add IP address of all hosts to all hosts
+    lineinfile:
+      dest: /etc/hosts
+      regexp: '.*{{ item }}$'
+      line: "{{ hostvars[item].ansible_host }} {{item}}"
+      state: present
+    when: hostvars[item].ansible_host is defined
+    with_items: "{{ groups.all }}"
+  
+  - name: Install packages that allow apt to be used over HTTPS
+    apt:
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg-agent
+      - software-properties-common
+
+  - name: Add an apt signing key for Docker
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+
+  - name: Add apt repository for stable version
+    apt_repository:
+      repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu xenial stable
+      state: present
+
+  - name: Install docker and its dependecies
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - docker-ce 
+      - docker-ce-cli 
+      - containerd.io
+    notify:
+      - docker status
+
+  - name: "Add {{ user }} user to docker group"
+    user:
+      name: "{{ user }}"
+      group: docker
+
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+  - name: Add an apt signing key for Kubernetes
+    apt_key:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      state: present
+
+  - name: Adding apt repository for Kubernetes
+    apt_repository:
+      repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+      state: present
+      filename: kubernetes.list
+
+  - name: Install Kubernetes binaries
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+        - kubelet 
+        - kubeadm 
+        - kubectl
+
+  - name: Configure node ip
+    copy:
+      dest: /etc/default/kubelet
+      content: "KUBELET_EXTRA_ARGS=--node-ip={{ node_port }}"
+
+  - name: Restart kubelet
+    service:
+      name: kubelet
+      daemon_reload: yes
+      state: restarted
+
+  - name: Initialize the Kubernetes cluster using kubeadm
+    command: 'kubeadm init --apiserver-advertise-address="{{ node_port }}"  --pod-network-cidr=10.244.0.0/16 --ignore-preflight-errors=all'
+    when:  master 
+
+  - name: sleeping for 2 mins
+    wait_for: timeout=120
+    when: master
+
+  - name: "Setup kubeconfig for {{ user }} user"
+    command: "{{ item }}"
+    with_items:
+     - "mkdir -p /home/{{ user }}/.kube"
+     - "cp -i /etc/kubernetes/admin.conf /home/{{ user }}/.kube/config"
+     - "chown {{ user }}:{{ user }} /home/{{ user }}/.kube/config"
+    when: master
+
+  - name: Install flannel networking
+    become: false
+    command: kubectl create -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+    when: master
+
+  - name: sleep for 2 Mins for flannel networking
+    wait_for: timeout=120
+    when: master
+
+  - name: copy the yml for Dashboard
+    copy:
+      src: "files/{{ item }}"
+      dest: "/home/{{ user }}/{{ item }}"
+    with_items:
+      - rb.yml
+      - recommended.yaml
+    when: master
+
+  - name: Deploy the Dashbord
+    become: false
+    shell: "kubectl apply -f /home/{{ user }}/recommended.yaml"
+    when: master
+  
+  - name: Creat service account and rbac
+    become: false
+    shell: "kubectl apply -f /home/{{ user }}/rb.yml"
+    when: master
+
+  - name: Generate join command
+    command: kubeadm token create --print-join-command
+    register: join_command
+    when: master
+
+  - name: Copy join command to local file
+    copy: 
+      content: "{{ join_command.stdout_lines[0] }}"
+      dest: "/home/{{ user }}/join-command.sh"
+    when:  master
+
+  - name: Fetch the join script to ansible master
+    run_once: yes
+    fetch:
+      src: "/home/{{ user }}/join-command.sh"
+      dest: /tmp/join-command.sh
+      flat: yes
+    when: master
+
+  - name: Copy the file from master to worker
+    copy:
+      src: /tmp/join-command.sh
+      dest: "/home/{{ user }}/join-command.sh"
+      mode: "0755"
+    when: master == "false"
+
+  - name: Join the worker to master node
+    shell: "sh /home/{{ user }}/join-command.sh"
+    when: master == "false"
+
+  handlers:
+    - name: docker status
+      service: name=docker state=started
